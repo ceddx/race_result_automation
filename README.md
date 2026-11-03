@@ -44,6 +44,21 @@ Install the dependencies:
 python -m pip install -r requirements.txt
 ```
 
+## Build a Windows application
+
+The repository includes a PyInstaller configuration for distributing the
+application to Windows users who do not have Python installed. From a
+PowerShell terminal:
+
+```powershell
+.\build_windows.ps1
+```
+
+The portable application is created as
+`dist\ChronometrageCycliste.exe`.
+The application opens the local web interface automatically and stores its
+SQLite database in a `data` folder next to the executable.
+
 ## Run the application
 
 Start the local server:
@@ -73,9 +88,10 @@ is hidden from the ranking.
 Bib setup is cumulative: each click on **Save bibs** adds a new batch of bibs
 and exclusions without removing previous entries.
 
-For a target-duration race, the first recorded passage is used as the
-reference lap. The application then calculates the nearest whole number of
-laps for the target duration.
+For a target-duration race, the first two recorded passages are used to
+estimate the average lap time. The application then calculates the nearest
+whole number of laps for the target duration. Corrections or cancellations of
+passages recalculate this value.
 
 A bib with recorded passages cannot be removed from a race, preserving the
 timing history.
@@ -115,6 +131,8 @@ and frontend rendering behaviors.
 ├── data/                 # Local runtime data, ignored by Git
 ├── tests/
 │   └── test_app.py       # Automated tests
+├── build_windows.ps1     # Windows packaging script
+├── chronometrage.spec    # PyInstaller configuration
 ├── .gitignore
 ├── requirements.txt
 ├── run.py                # Local application entry point

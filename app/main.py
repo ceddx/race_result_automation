@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import sqlite3
+import sys
 import time
 from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
@@ -15,7 +16,11 @@ from pydantic import BaseModel, Field
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = (
+    Path(sys.executable).resolve().parent / "data"
+    if getattr(sys, "frozen", False)
+    else BASE_DIR / "data"
+)
 DATA_DIR.mkdir(exist_ok=True)
 DATABASE = DATA_DIR / "cycling_timer.sqlite3"
 
