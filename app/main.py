@@ -30,7 +30,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Chronométrage cycliste", lifespan=lifespan)
+app = FastAPI(title="Cycling Race Timer", lifespan=lifespan)
 
 
 def now_iso() -> str:
