@@ -64,6 +64,75 @@ def test_bib_ranges_and_exclusions_are_applied(isolated_database: None) -> None:
     assert race["exclusions"] == ["2", "5"]
 
 
+def test_bib_setup_adds_multiple_batches(isolated_database: None) -> None:
+    race_id = create_race("Multiple batches")
+
+    main.setup_participants(
+        race_id,
+        main.ParticipantSetupInput(bibs="1-3", exclusions="9"),
+    )
+    main.setup_participants(
+        race_id,
+        main.ParticipantSetupInput(bibs="4 5", exclusions="10-11"),
+    )
+
+    race = main.list_races()[0]
+    assert race["bibs"] == ["1", "2", "3", "4", "5"]
+    assert race["exclusions"] == ["9", "10", "11"]
+
+
+def test_bib_setup_can_reactivate_a_previously_excluded_bib(
+    isolated_database: None,
+) -> None:
+    race_id = create_race("Reactivated bib")
+
+    main.setup_participants(
+        race_id,
+        main.ParticipantSetupInput(bibs="1-5", exclusions="3"),
+    )
+    main.setup_participants(
+        race_id,
+        main.ParticipantSetupInput(bibs="3"),
+    )
+
+    race = main.list_races()[0]
+    assert race["bibs"] == ["1", "2", "3", "4", "5"]
+    assert race["exclusions"] == []
+
+
+def test_a_bib_can_only_be_assigned_to_one_race(
+    isolated_database: None,
+) -> None:
+    first_race = create_race("First race")
+    second_race = create_race("Second race")
+    main.setup_participants(first_race, main.ParticipantSetupInput(bibs="42"))
+
+    with pytest.raises(main.HTTPException, match="autre course"):
+        main.setup_participants(
+            second_race,
+            main.ParticipantSetupInput(bibs="42"),
+        )
+
+    with pytest.raises(main.HTTPException, match="autre course"):
+        main.add_participant(
+            second_race,
+            main.ParticipantInput(bib="42"),
+        )
+
+
+def test_ready_race_lists_bibs_in_ascending_order(
+    isolated_database: None,
+) -> None:
+    race_id = create_race("Ascending bibs")
+
+    main.setup_participants(
+        race_id,
+        main.ParticipantSetupInput(bibs="12 3 1 20 2"),
+    )
+
+    assert main.list_races()[0]["bibs"] == ["1", "2", "3", "12", "20"]
+
+
 def test_invalid_bib_ranges_are_rejected(isolated_database: None) -> None:
     with pytest.raises(main.HTTPException, match="Plage de dossards invalide"):
         main.parse_bib_tokens("10-4")
@@ -150,18 +219,49 @@ def test_unknown_or_finished_bibs_are_rejected(isolated_database: None) -> None:
         main.record_passage(main.PassageInput(bib="7"))
 
 
-def test_target_duration_calculates_laps_from_first_passage(
+def test_target_duration_calculates_laps_from_second_passage(
     isolated_database: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     race_id = create_race("Target race", laps=None, target_minutes=10)
     main.setup_participants(race_id, main.ParticipantSetupInput(bibs="1 2"))
     set_race_running(race_id)
-    monkeypatch.setattr(main, "race_elapsed", lambda row: 120.0)
+    elapsed_values = iter([120.0, 120.0, 240.0, 240.0])
+    monkeypatch.setattr(main, "race_elapsed", lambda row: next(elapsed_values))
 
+    main.record_passage(main.PassageInput(bib="1"))
+    assert main.list_races()[0]["laps"] == 1
     main.record_passage(main.PassageInput(bib="1"))
 
     assert main.list_races()[0]["laps"] == 5
+
+
+def test_target_duration_recalculates_after_passage_correction(
+    isolated_database: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    race_id = create_race("Corrected target race", laps=None, target_minutes=10)
+    main.setup_participants(race_id, main.ParticipantSetupInput(bibs="12 13"))
+    set_race_running(race_id)
+    def elapsed(row: object) -> float:
+        with main.connect() as db:
+            count = db.execute(
+                "SELECT COUNT(*) FROM passages WHERE race_id = ? AND cancelled = 0",
+                (race_id,),
+            ).fetchone()[0]
+        return {0: 120.0, 1: 240.0}.get(count, 300.0)
+
+    monkeypatch.setattr(main, "race_elapsed", elapsed)
+
+    main.record_passage(main.PassageInput(bib="12"))
+    second = main.record_passage(main.PassageInput(bib="12"))
+    assert main.list_races()[0]["laps"] == 5
+
+    main.update_passage_bib(second["id"], main.PassageBibUpdateInput(bib="13"))
+    assert main.list_races()[0]["laps"] == 1
+
+    main.record_passage(main.PassageInput(bib="13"))
+    assert main.list_races()[0]["laps"] == 4
 
 
 def test_standings_sort_by_laps_then_total_time(
@@ -214,15 +314,26 @@ def test_participants_with_passages_cannot_be_removed(
     main.record_passage(main.PassageInput(bib="1"))
 
     with pytest.raises(main.HTTPException, match="déjà enregistrés"):
-        main.setup_participants(race_id, main.ParticipantSetupInput(bibs="2"))
+        main.setup_participants(
+            race_id,
+            main.ParticipantSetupInput(bibs="2", exclusions="1"),
+        )
 
 
 def test_frontend_escapes_user_controlled_values(isolated_database: None) -> None:
     html = main.index()
 
     assert "const escapeHtml=" in html
+    assert "Créé par Cedric Grandvaux" in html
+    assert "cedric.grandvaux@gmail.com" in html
+    assert 'src="/logo-ffc.png"' in html
+    assert "tours calculés après 2 tours" in html
+    assert "r.laps>1?`${r.laps} tours`" in html
+    assert "<th>Tours restants</th>" in html
+    assert 'id="sync-controls"' in html
+    assert "races.filter(r=>r.status==='ready').length>=2" in html
+    assert "r.status==='running'?`<button onclick=\"timer(${r.id},'pause')\">Pause</button>`" in html
     assert "escapeHtml(r.name)" in html
     assert "escapeHtml(x.race_name)" in html
     assert "escapeHtml(x.bib)" in html
-    assert "r.bibs.map(escapeHtml)" in html
-    assert "r.exclusions.map(escapeHtml)" in html
+    assert "escapeHtml(x.bib)" in html

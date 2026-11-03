@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 
@@ -104,10 +104,6 @@ class ParticipantSetupInput(BaseModel):
     exclusions: str = Field(default="", max_length=10000)
 
 
-class RaceRenameInput(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
-
-
 class RaceUpdateInput(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     laps: int = Field(gt=0, le=10000)
@@ -168,6 +164,23 @@ def parse_bib_tokens(value: str) -> set[str]:
     return bibs
 
 
+def bibs_in_other_races(
+    db: sqlite3.Connection,
+    race_id: int,
+    bibs: set[str],
+) -> list[str]:
+    if not bibs:
+        return []
+    placeholders = ", ".join("?" for _ in bibs)
+    rows = db.execute(
+        f"SELECT bib FROM participants "
+        f"WHERE race_id != ? AND bib IN ({placeholders}) "
+        "ORDER BY CAST(bib AS INTEGER), bib",
+        (race_id, *bibs),
+    ).fetchall()
+    return [row["bib"] for row in rows]
+
+
 def participant_stats(db: sqlite3.Connection, participant: sqlite3.Row, race: sqlite3.Row) -> dict[str, Any]:
     passages = db.execute(
         "SELECT * FROM passages WHERE participant_id = ? AND cancelled = 0 ORDER BY lap_number",
@@ -203,8 +216,40 @@ def participant_stats(db: sqlite3.Connection, participant: sqlite3.Row, race: sq
             if race["distance_defined"]
             else None
         ),
-        "finished": laps_done >= race["laps"],
+        "finished": laps_done >= race["laps"] and not (
+            race["target_seconds"] and laps_done < 2
+        ),
     }
+
+
+def recalculate_target_laps(db: sqlite3.Connection, race_id: int) -> None:
+    race = db.execute(
+        "SELECT target_seconds FROM races WHERE id = ?",
+        (race_id,),
+    ).fetchone()
+    if not race or not race["target_seconds"]:
+        return
+    passages = db.execute(
+        "SELECT participant_id, elapsed_seconds FROM passages "
+        "WHERE race_id = ? AND cancelled = 0 ORDER BY recorded_at, id",
+        (race_id,),
+    ).fetchall()
+    passage_counts: dict[int, list[float]] = {}
+    calculated_laps = 1
+    for passage in passages:
+        participant_passages = passage_counts.setdefault(passage["participant_id"], [])
+        participant_passages.append(float(passage["elapsed_seconds"]))
+        if len(participant_passages) == 2:
+            average_lap_seconds = participant_passages[1] / 2
+            calculated_laps = max(
+                2,
+                round(float(race["target_seconds"]) / max(average_lap_seconds, 0.001)),
+            )
+            break
+    db.execute(
+        "UPDATE races SET laps = ? WHERE id = ?",
+        (calculated_laps, race_id),
+    )
 
 
 def race_payload(db: sqlite3.Connection, race: sqlite3.Row) -> dict[str, Any]:
@@ -213,7 +258,21 @@ def race_payload(db: sqlite3.Connection, race: sqlite3.Row) -> dict[str, Any]:
         (race["id"],),
     ).fetchall()
     stats = [participant_stats(db, item, race) for item in participants]
-    stats.sort(key=lambda item: (-item["laps_done"], item["total_seconds"] or float("inf"), item["bib"]))
+    if race["status"] == "ready":
+        stats.sort(
+            key=lambda item: (
+                int(item["bib"]) if item["bib"].isdigit() else float("inf"),
+                item["bib"],
+            )
+        )
+    else:
+        stats.sort(
+            key=lambda item: (
+                -item["laps_done"],
+                item["total_seconds"] or float("inf"),
+                item["bib"],
+            )
+        )
     exclusions = [
         row["bib"]
         for row in db.execute(
@@ -245,6 +304,16 @@ def race_payload(db: sqlite3.Connection, race: sqlite3.Row) -> dict[str, Any]:
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return HTML
+
+
+@app.get("/favicon.png", include_in_schema=False)
+def favicon() -> FileResponse:
+    return FileResponse(BASE_DIR / "app" / "static" / "favicon_ffc.png", media_type="image/png")
+
+
+@app.get("/logo-ffc.png", include_in_schema=False)
+def ffc_logo() -> FileResponse:
+    return FileResponse(BASE_DIR / "app" / "static" / "Logo_FFC.png", media_type="image/png")
 
 
 @app.get("/api/races")
@@ -289,22 +358,6 @@ def delete_race(race_id: int) -> dict[str, bool]:
         return {"ok": True}
 
 
-@app.patch("/api/races/{race_id}")
-def rename_race(race_id: int, data: RaceRenameInput) -> dict[str, Any]:
-    name = data.name.strip()
-    with closing(connect()) as db:
-        if not db.execute("SELECT 1 FROM races WHERE id = ?", (race_id,)).fetchone():
-            raise HTTPException(404, "Course inconnue")
-        if db.execute(
-            "SELECT 1 FROM races WHERE lower(name) = lower(?) AND id != ?",
-            (name, race_id),
-        ).fetchone():
-            raise HTTPException(409, "Le nom de cette course existe déjà")
-        db.execute("UPDATE races SET name = ? WHERE id = ?", (name, race_id))
-        db.commit()
-    return {"id": race_id, "name": name}
-
-
 @app.patch("/api/races/{race_id}/details")
 def update_race_details(race_id: int, data: RaceUpdateInput) -> dict[str, Any]:
     name = data.name.strip()
@@ -338,10 +391,13 @@ def add_participant(race_id: int, data: ParticipantInput) -> dict[str, Any]:
     with closing(connect()) as db:
         if not db.execute("SELECT 1 FROM races WHERE id = ?", (race_id,)).fetchone():
             raise HTTPException(404, "Course inconnue")
+        bib = data.bib.strip()
+        if bibs_in_other_races(db, race_id, {bib}):
+            raise HTTPException(409, "Ce dossard est déjà attribué à une autre course")
         try:
             cursor = db.execute(
                 "INSERT INTO participants(race_id, bib, first_name, last_name) VALUES (?, ?, ?, ?)",
-                (race_id, data.bib.strip(), data.first_name.strip(), data.last_name.strip()),
+                (race_id, bib, data.first_name.strip(), data.last_name.strip()),
             )
             db.commit()
         except sqlite3.IntegrityError as exc:
@@ -356,35 +412,55 @@ def setup_participants(race_id: int, data: ParticipantSetupInput) -> dict[str, i
     with closing(connect()) as db:
         if not db.execute("SELECT 1 FROM races WHERE id = ?", (race_id,)).fetchone():
             raise HTTPException(404, "Course inconnue")
-        bibs -= exclusions
-        current = db.execute(
-            "SELECT id, bib FROM participants WHERE race_id = ?",
-            (race_id,),
-        ).fetchall()
-        removable = [item for item in current if item["bib"] not in bibs]
-        protected = [
-            item for item in removable
-            if db.execute(
-                "SELECT 1 FROM passages WHERE participant_id = ? LIMIT 1",
-                (item["id"],),
+        existing_exclusions = {
+            row["bib"]
+            for row in db.execute(
+                "SELECT bib FROM race_exclusions WHERE race_id = ?",
+                (race_id,),
+            ).fetchall()
+        }
+        bibs_to_add = bibs - exclusions
+        conflicts = bibs_in_other_races(db, race_id, bibs_to_add)
+        if conflicts:
+            raise HTTPException(
+                409,
+                "Les dossards sont déjà attribués à une autre course : "
+                + ", ".join(conflicts),
+            )
+        for bib in bibs_to_add & existing_exclusions:
+            db.execute(
+                "DELETE FROM race_exclusions WHERE race_id = ? AND bib = ?",
+                (race_id, bib),
+            )
+        exclusions_to_add = exclusions - existing_exclusions
+        protected = []
+        for bib in exclusions_to_add:
+            participant = db.execute(
+                "SELECT id, bib FROM participants WHERE race_id = ? AND bib = ?",
+                (race_id, bib),
             ).fetchone()
-        ]
+            if participant and db.execute(
+                "SELECT 1 FROM passages WHERE participant_id = ? LIMIT 1",
+                (participant["id"],),
+            ).fetchone():
+                protected.append(participant)
         if protected:
             protected_bibs = ", ".join(item["bib"] for item in protected)
             raise HTTPException(
                 409,
-                f"Impossible de retirer les dossards déjà enregistrés : {protected_bibs}",
+                f"Impossible d'exclure les dossards déjà enregistrés : {protected_bibs}",
             )
-        for item in removable:
-            db.execute("DELETE FROM participants WHERE id = ?", (item["id"],))
-        db.execute("DELETE FROM race_exclusions WHERE race_id = ?", (race_id,))
-        for bib in exclusions:
+        for bib in exclusions_to_add:
             db.execute(
                 "INSERT INTO race_exclusions(race_id, bib) VALUES (?, ?)",
                 (race_id, bib),
             )
+            db.execute(
+                "DELETE FROM participants WHERE race_id = ? AND bib = ?",
+                (race_id, bib),
+            )
         added = 0
-        for bib in bibs:
+        for bib in bibs_to_add:
             try:
                 db.execute(
                     "INSERT INTO participants(race_id, bib) VALUES (?, ?)",
@@ -428,10 +504,23 @@ async def import_participants(race_id: int, file: UploadFile = File(...)) -> dic
             {key.strip().lower(): value for key, value in row.items()}
             for row in reader
         )
+    records = list(records)
     added = 0
     with closing(connect()) as db:
         if not db.execute("SELECT 1 FROM races WHERE id = ?", (race_id,)).fetchone():
             raise HTTPException(404, "Course inconnue")
+        imported_bibs = {
+            (row.get("bib") or "").strip()
+            for row in records
+            if (row.get("bib") or "").strip()
+        }
+        conflicts = bibs_in_other_races(db, race_id, imported_bibs)
+        if conflicts:
+            raise HTTPException(
+                409,
+                "Les dossards sont déjà attribués à une autre course : "
+                + ", ".join(conflicts),
+            )
         for row in records:
             bib = (row.get("bib") or "").strip()
             if not bib:
@@ -519,7 +608,8 @@ def start_selected_timers(data: RaceSelectionInput) -> dict[str, Any]:
 def record_passage(data: PassageInput) -> dict[str, Any]:
     with closing(connect()) as db:
         participant = db.execute(
-            "SELECT p.*, r.status, r.started_at, r.paused_at, r.paused_seconds, r.laps, r.lap_distance_km, r.name "
+            "SELECT p.*, r.status, r.started_at, r.paused_at, r.paused_seconds, "
+            "r.laps, r.target_seconds, r.lap_distance_km, r.name "
             "FROM participants p JOIN races r ON r.id = p.race_id WHERE p.bib = ?",
             (data.bib.strip(),),
         ).fetchone()
@@ -531,24 +621,22 @@ def record_passage(data: PassageInput) -> dict[str, Any]:
             "SELECT * FROM passages WHERE participant_id = ? AND cancelled = 0 ORDER BY lap_number DESC LIMIT 1",
             (participant["id"],),
         ).fetchone()
-        if previous and previous["lap_number"] >= participant["laps"]:
+        if (
+            previous
+            and previous["lap_number"] >= participant["laps"]
+            and not (participant["target_seconds"] and participant["laps"] == 1)
+        ):
             raise HTTPException(409, "Ce coureur a déjà terminé")
         race = db.execute("SELECT * FROM races WHERE id = ?", (participant["race_id"],)).fetchone()
         elapsed = race_elapsed(race)
         lap_number = (previous["lap_number"] if previous else 0) + 1
         lap_seconds = elapsed - (previous["elapsed_seconds"] if previous else 0)
-        if previous is None and race["target_seconds"]:
-            calculated_laps = max(1, round(float(race["target_seconds"]) / max(lap_seconds, 0.001)))
-            db.execute(
-                "UPDATE races SET laps = ? WHERE id = ?",
-                (calculated_laps, race["id"]),
-            )
-            race = db.execute("SELECT * FROM races WHERE id = ?", (race["id"],)).fetchone()
         cursor = db.execute(
             "INSERT INTO passages(race_id, participant_id, recorded_at, elapsed_seconds, lap_number, lap_seconds) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (participant["race_id"], participant["id"], now_iso(), elapsed, lap_number, max(0, lap_seconds)),
         )
+        recalculate_target_laps(db, race["id"])
         db.commit()
         return {
             "id": cursor.lastrowid,
@@ -563,10 +651,15 @@ def record_passage(data: PassageInput) -> dict[str, Any]:
 @app.post("/api/passages/{passage_id}/cancel")
 def cancel_passage(passage_id: int) -> dict[str, bool]:
     with closing(connect()) as db:
-        result = db.execute("UPDATE passages SET cancelled = 1 WHERE id = ? AND cancelled = 0", (passage_id,))
-        db.commit()
-        if result.rowcount == 0:
+        passage = db.execute(
+            "SELECT race_id FROM passages WHERE id = ? AND cancelled = 0",
+            (passage_id,),
+        ).fetchone()
+        if not passage:
             raise HTTPException(404, "Passage introuvable")
+        result = db.execute("UPDATE passages SET cancelled = 1 WHERE id = ?", (passage_id,))
+        recalculate_target_laps(db, passage["race_id"])
+        db.commit()
         return {"ok": True}
 
 
@@ -590,6 +683,7 @@ def update_passage_bib(passage_id: int, data: PassageBibUpdateInput) -> dict[str
             "UPDATE passages SET participant_id = ? WHERE id = ?",
             (participant["id"], passage_id),
         )
+        recalculate_target_laps(db, passage["race_id"])
         db.commit()
     return {"id": passage_id, "bib": participant["bib"]}
 
@@ -610,7 +704,7 @@ def recent_passages() -> list[dict[str, Any]]:
 HTML = r"""<!doctype html>
 <html lang="fr">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" type="image/png" href="/favicon.png">
 <title>Chronométrage cycliste</title>
 <style>
 :root{font-family:Inter,Segoe UI,sans-serif;color:#172033;background:#f2f5f8}*{box-sizing:border-box}
@@ -623,6 +717,7 @@ h1,h2,h3{margin:0 0 12px}.top h1{font-size:22px}.layout{max-width:1500px;margin:
 .card-head{display:flex;justify-content:space-between;gap:12px}.timer{font:700 28px ui-monospace,monospace;color:#1769aa}.status{font-size:12px;text-transform:uppercase;font-weight:700;padding:5px 8px;border-radius:20px;background:#e8edf3}
 .controls{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}.controls button{padding:8px 12px;border:1px solid #c8d1dc;background:#fff;border-radius:7px;cursor:pointer}.controls button.primary{background:#1769aa;color:#fff}.select-race{display:flex;align-items:center;gap:5px;padding:8px 4px;font-size:13px}
 table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:8px 5px;border-bottom:1px solid #e8edf3}th{color:#59697e}.standings-scroll{max-height:360px;overflow-y:auto}.muted{color:#68778a;font-size:13px}.form{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}.form input{padding:8px;border:1px solid #bcc8d5;border-radius:6px;min-width:100px}.section{margin-top:20px}.recent{max-height:250px;overflow:auto}
+.footer{margin-top:30px;padding:22px 24px;background:white;display:flex;justify-content:space-between;align-items:center;gap:20px;color:#59697e}.footer-logo{width:130px;height:70px;object-fit:contain}
 @media(max-width:650px){.layout{padding:10px}.grid{grid-template-columns:1fr}.top{padding:14px}.inputbar input{width:130px}.message{display:block;margin:10px 0 0}}
 </style></head>
 <body><header class="top"><h1>Chronométrage cycliste</h1><span>Classement provisoire</span></header>
@@ -636,10 +731,11 @@ table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;p
 <input id="raceTarget" type="number" min="0.1" step="0.1" placeholder="Minutes visées" style="display:none">
 <input id="raceDistance" type="number" min="0.01" step="0.01" placeholder="Km/tour (optionnel)">
 <button class="button">Suivant</button></form></section>
-<section class="card section"><button class="button" onclick="startSelected()">Démarrer les courses sélectionnées ensemble</button><span class="muted"> Cochez les courses à lancer au même moment.</span></section>
+<section id="sync-controls" class="card section" style="display:none"><button class="button" onclick="startSelected()">Démarrer les courses sélectionnées ensemble</button><span class="muted"> Cochez les courses à lancer au même moment.</span></section>
 <section class="card section"><h2>Derniers passages</h2><div id="recent" class="recent"></div></section>
 <section id="races" class="grid section"></section>
 </main>
+<footer class="footer"><span>Créé par Cedric Grandvaux · Si vous voyez une erreur ou avez des améliorations, contactez-moi par mail : <a href="mailto:cedric.grandvaux@gmail.com">cedric.grandvaux@gmail.com</a></span><img class="footer-logo" src="/logo-ffc.png" alt="Logo FFC"></footer>
 <script>
 const $=id=>document.getElementById(id);
 const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
@@ -653,17 +749,16 @@ async function record(){const input=$('bib');if(!input.value.trim())return;try{c
 async function createRace(e){e.preventDefault();try{const target=document.querySelector('input[name="raceMode"]:checked').value==='target';const name=$('raceName').value.trim();const laps=$('raceLaps').value.trim();const targetMinutes=$('raceTarget').value.trim();if(!name){flash('Renseignez le nom de la course');return}if(target&&!targetMinutes){flash('Renseignez le temps visé');return}if(!target&&!laps){flash('Renseignez le nombre de tours');return}const race=await api('/api/races',{method:'POST',body:JSON.stringify({name,laps:target?null:Number(laps),target_minutes:target?Number(targetMinutes):null,lap_distance_km:$('raceDistance').value?Number($('raceDistance').value):null})});e.target.reset();toggleRaceMode();await refresh();document.querySelector(`[data-race-id="${race.id}"]`)?.scrollIntoView({behavior:'smooth'})}catch(e){flash(e.message)}}
 async function timer(id,action){try{await api(`/api/races/${id}/timer/${action}`,{method:'POST'});refresh()}catch(e){flash(e.message)}}
 async function startSelected(){const ids=[...document.querySelectorAll('.race-select:checked')].map(input=>Number(input.value));if(!ids.length){flash('Sélectionnez au moins une course');return}try{await api('/api/races/timer/start-selected',{method:'POST',body:JSON.stringify({race_ids:ids})});flash('Chronomètres démarrés ensemble',true);await refresh()}catch(e){flash(e.message)}}
-async function renameRace(id,button){const current=button.closest('[data-race-id]').querySelector('h2').textContent;const name=prompt('Nouveau nom de la course :',current);if(name===null||!name.trim()||name.trim()===current)return;try{await api(`/api/races/${id}`,{method:'PATCH',body:JSON.stringify({name:name.trim()})});flash('Course renommée',true);await refresh()}catch(e){flash(e.message)}}
 async function editRace(id,button){const card=button.closest('[data-race-id]');const name=prompt('Nom de la course :',card.querySelector('h2').textContent);if(name===null||!name.trim())return;const laps=prompt('Nombre de tours :',card.dataset.laps);if(laps===null||!laps.trim()||Number(laps)<=0){flash('Renseignez un nombre de tours valide');return}const distance=prompt('Km par tour (laisser vide pour ne pas afficher la vitesse moyenne) :',card.dataset.distance||'');if(distance===null)return;const target=card.dataset.target?Number(card.dataset.target):null;const targetValue=target===null?null:prompt('Temps visé en minutes :',target);if(target!==null&&(targetValue===null||!targetValue.trim()||Number(targetValue)<=0)){flash('Renseignez un temps visé valide');return}try{await api(`/api/races/${id}/details`,{method:'PATCH',body:JSON.stringify({name:name.trim(),laps:Number(laps),target_minutes:targetValue===null?null:Number(targetValue),lap_distance_km:distance.trim()?Number(distance):null})});flash('Caractéristiques modifiées',true);await refresh()}catch(e){flash(e.message)}}
 async function removeRace(id,button){const name=button.closest('[data-race-id]').querySelector('h2').textContent;if(!confirm(`Supprimer la course « ${name} » et tout son historique ?`))return;try{await api(`/api/races/${id}`,{method:'DELETE'});flash('Course supprimée',true);await refresh()}catch(e){flash(e.message)}}
 async function updatePassage(id,button){const current=button.parentElement.querySelector('b').textContent;const bib=prompt('Nouveau dossard pour ce passage :',current);if(bib===null||!bib.trim()||bib.trim()===current)return;try{await api(`/api/passages/${id}`,{method:'PATCH',body:JSON.stringify({bib:bib.trim()})});flash('Dossard du passage modifié',true);await refresh()}catch(e){flash(e.message)}}
-async function setupParticipants(id,form){const fd=new FormData(form);try{await api(`/api/races/${id}/participants/setup`,{method:'POST',body:JSON.stringify({bibs:fd.get('bibs'),exclusions:fd.get('exclusions')})});flash('Dossards et exclusions enregistrés',true);await refresh()}catch(e){flash(e.message)}}
+async function setupParticipants(id,form){const fd=new FormData(form);try{await api(`/api/races/${id}/participants/setup`,{method:'POST',body:JSON.stringify({bibs:fd.get('bibs'),exclusions:fd.get('exclusions')})});form.reset();flash('Dossards et exclusions enregistrés',true);await refresh()}catch(e){flash(e.message)}}
 async function cancelPassage(id){try{await api(`/api/passages/${id}/cancel`,{method:'POST'});flash('Dernier passage annulé',true);refresh()}catch(e){flash(e.message)}}
-function row(x,showSpeed){return `<tr><td>${x.position}</td><td><b>${escapeHtml(x.bib)}</b></td><td>${x.laps_done}/${x.laps_done+x.laps_remaining}</td><td>${x.laps_behind?'−'+x.laps_behind+' tour':'—'}</td><td>${fmt(x.last_lap_seconds)}</td>${showSpeed?`<td>${num(x.average_speed_kmh)} km/h</td>`:''}</tr>`}
-function raceCard(r){let buttons=r.status==='ready'?`<button class="primary" onclick="timer(${r.id},'start')">Démarrer</button>`:r.status==='running'?`<button onclick="timer(${r.id},'pause')">Pause</button><button onclick="timer(${r.id},'stop')">Arrêter</button>`:r.status==='paused'?`<button class="primary" onclick="timer(${r.id},'resume')">Reprendre</button><button onclick="timer(${r.id},'stop')">Arrêter</button>`:'';let selection=r.status==='ready'?`<label class="select-race"><input class="race-select" type="checkbox" value="${r.id}"> Lancer avec la sélection</label>`:'';let laps=r.target_seconds?`${r.laps} tours calculés après le 1er tour · objectif ${Math.round(r.target_seconds/60)} min`:`${r.laps} tours`;let distance=r.lap_distance_km==null?'distance non définie':`${r.lap_distance_km} km/tour`;let bibs=r.bibs.map(escapeHtml).join(' ');let exclusions=r.exclusions.map(escapeHtml).join(' ');let standingsClass=r.standings.length>10?'standings-scroll':'';let showSpeed=r.lap_distance_km!=null;let speedHeader=showSpeed?'<th>Vitesse moy.</th>':'';let emptyColumns=showSpeed?6:5;return `<article class="card" data-race-id="${r.id}" data-laps="${r.laps}" data-target="${r.target_seconds?Math.round(r.target_seconds/60):''}" data-distance="${r.lap_distance_km??''}"><div class="card-head"><div><h2>${escapeHtml(r.name)}</h2><div class="muted">${laps} · ${escapeHtml(distance)} · ${r.participant_count} participants · ${r.finished_count} terminé(s)</div></div><div><div class="timer" data-elapsed="${r.elapsed_seconds}" data-status="${r.status}">${fmt(r.elapsed_seconds)}</div><span class="status">${r.status}</span></div></div><div class="controls">${buttons}${selection}<button onclick="editRace(${r.id},this)">Modifier</button><button onclick="renameRace(${r.id},this)">Renommer</button><button onclick="removeRace(${r.id},this)">Supprimer</button></div><form class="form" onsubmit="setupParticipants(${r.id},this);return false"><input name="bibs" value="${bibs}" placeholder="Dossards : 1 2 3 ou 4-65"><input name="exclusions" value="${exclusions}" placeholder="Exclus : 7 12 ou 40-45"><button class="button">Enregistrer les dossards</button></form><div class="${standingsClass}"><table><thead><tr><th>#</th><th>Dossard</th><th>Tours</th><th>Retard</th><th>Dernier tour</th>${speedHeader}</tr></thead><tbody>${r.standings.map(item=>row(item,showSpeed)).join('')||`<tr><td colspan="${emptyColumns}" class="muted">Configurez les dossards de cette course.</td></tr>`}</tbody></table></div></article>`}
+function row(x,showSpeed){return `<tr><td>${x.position}</td><td><b>${escapeHtml(x.bib)}</b></td><td>${x.laps_done}/${x.laps_done+x.laps_remaining}</td><td>${x.laps_remaining}</td><td>${x.laps_behind?'−'+x.laps_behind+' tour':'—'}</td><td>${fmt(x.last_lap_seconds)}</td>${showSpeed?`<td>${num(x.average_speed_kmh)} km/h</td>`:''}</tr>`}
+function raceCard(r){let buttons=r.status==='ready'?`<button class="primary" onclick="timer(${r.id},'start')">Démarrer</button>`:r.status==='running'?`<button onclick="timer(${r.id},'pause')">Pause</button>`:r.status==='paused'?`<button class="primary" onclick="timer(${r.id},'resume')">Reprendre</button><button onclick="timer(${r.id},'stop')">Arrêter</button>`:'';let selection=r.status==='ready'?`<label class="select-race"><input class="race-select" type="checkbox" value="${r.id}"> Lancer avec la sélection</label>`:'';let laps=r.target_seconds?(r.laps>1?`${r.laps} tours`:`tours calculés après 2 tours · objectif ${Math.round(r.target_seconds/60)} min`):`${r.laps} tours`;let distance=r.lap_distance_km==null?'distance non définie':`${r.lap_distance_km} km/tour`;let standingsClass=r.standings.length>10?'standings-scroll':'';let showSpeed=r.lap_distance_km!=null;let speedHeader=showSpeed?'<th>Vitesse moy.</th>':'';let emptyColumns=showSpeed?7:6;return `<article class="card" data-race-id="${r.id}" data-laps="${r.laps}" data-target="${r.target_seconds?Math.round(r.target_seconds/60):''}" data-distance="${r.lap_distance_km??''}"><div class="card-head"><div><h2>${escapeHtml(r.name)}</h2><div class="muted">${laps} · ${escapeHtml(distance)} · ${r.participant_count} participants · ${r.finished_count} terminé(s)</div></div><div><div class="timer" data-elapsed="${r.elapsed_seconds}" data-status="${r.status}">${fmt(r.elapsed_seconds)}</div><span class="status">${r.status}</span></div></div><div class="controls">${buttons}${selection}<button onclick="editRace(${r.id},this)">Modifier</button><button onclick="removeRace(${r.id},this)">Supprimer</button></div><form class="form" onsubmit="setupParticipants(${r.id},this);return false"><input name="bibs" placeholder="Dossards : 1 2 3 ou 4-65"><input name="exclusions" placeholder="Exclus : 7 12 ou 40-45"><button class="button">Enregistrer les dossards</button></form><div class="${standingsClass}"><table><thead><tr><th>#</th><th>Dossard</th><th>Tours</th><th>Tours restants</th><th>Retard</th><th>Dernier tour</th>${speedHeader}</tr></thead><tbody>${r.standings.map(item=>row(item,showSpeed)).join('')||`<tr><td colspan="${emptyColumns}" class="muted">Configurez les dossards de cette course.</td></tr>`}</tbody></table></div></article>`}
 let timerSyncAt=performance.now();
 function updateTimers(){const elapsed=performance.now()-timerSyncAt;document.querySelectorAll('.timer[data-elapsed]').forEach(timer=>{const base=Number(timer.dataset.elapsed);const value=timer.dataset.status==='running'?base+elapsed/1000:base;timer.textContent=fmt(value)})}
-async function refresh(){if(document.activeElement&&document.activeElement.matches('input,textarea'))return;const scrollPositions={};document.querySelectorAll('[data-race-id] .standings-scroll').forEach(element=>{scrollPositions[element.closest('[data-race-id]').dataset.raceId]=element.scrollTop});const [races,recent]=await Promise.all([api('/api/races'),api('/api/passages/recent')]);$('races').innerHTML=races.map(raceCard).join('');Object.entries(scrollPositions).forEach(([raceId,scrollTop])=>{const element=document.querySelector(`[data-race-id="${raceId}"] .standings-scroll`);if(element)element.scrollTop=scrollTop});timerSyncAt=performance.now();updateTimers();$('recent').innerHTML=recent.map(x=>`<div><b>${escapeHtml(x.bib)}</b> · ${escapeHtml(x.race_name)} · tour ${x.lap_number} · ${fmt(x.lap_seconds)} <button onclick="updatePassage(${x.id},this)">Modifier</button> <button onclick="cancelPassage(${x.id})">Annuler</button></div>`).join('')||'<span class="muted">Aucun passage.</span>'}
+async function refresh(){if(document.activeElement&&document.activeElement.matches('input,textarea'))return;const scrollPositions={};document.querySelectorAll('[data-race-id] .standings-scroll').forEach(element=>{scrollPositions[element.closest('[data-race-id]').dataset.raceId]=element.scrollTop});const [races,recent]=await Promise.all([api('/api/races'),api('/api/passages/recent')]);$('sync-controls').style.display=races.filter(r=>r.status==='ready').length>=2?'block':'none';$('races').innerHTML=races.map(raceCard).join('');Object.entries(scrollPositions).forEach(([raceId,scrollTop])=>{const element=document.querySelector(`[data-race-id="${raceId}"] .standings-scroll`);if(element)element.scrollTop=scrollTop});timerSyncAt=performance.now();updateTimers();$('recent').innerHTML=recent.map(x=>`<div><b>${escapeHtml(x.bib)}</b> · ${escapeHtml(x.race_name)} · tour ${x.lap_number} · ${fmt(x.lap_seconds)} <button onclick="updatePassage(${x.id},this)">Modifier</button> <button onclick="cancelPassage(${x.id})">Annuler</button></div>`).join('')||'<span class="muted">Aucun passage.</span>'}
 $('bib').addEventListener('keydown',e=>{if(e.key==='Enter')record()});refresh();setInterval(refresh,1000);setInterval(updateTimers,10);
 </script></body></html>"""
 

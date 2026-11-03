@@ -66,8 +66,12 @@ Press `Ctrl+C` in the terminal to stop the server.
 6. Start the race individually, or select several ready races and start them
    together.
 
-Race characteristics can be edited later with the **Modify** button. If no lap
-distance is configured, the average-speed column is hidden from the ranking.
+Race characteristics, including the name, can be edited later with the
+**Modify** button. If no lap distance is configured, the average-speed column
+is hidden from the ranking.
+
+Bib setup is cumulative: each click on **Save bibs** adds a new batch of bibs
+and exclusions without removing previous entries.
 
 For a target-duration race, the first recorded passage is used as the
 reference lap. The application then calculates the nearest whole number of
