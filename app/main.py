@@ -676,6 +676,58 @@ def record_passage(data: PassageInput) -> dict[str, Any]:
         }
 
 
+@app.post("/api/races/{race_id}/passages/bulk")
+def record_bulk_passages(race_id: int) -> dict[str, Any]:
+    with closing(connect()) as db:
+        race = db.execute(
+            "SELECT * FROM races WHERE id = ?",
+            (race_id,),
+        ).fetchone()
+        if not race:
+            raise HTTPException(404, "Course inconnue")
+        if race["status"] != "running":
+            raise HTTPException(409, "Le chronomètre n'est pas en cours")
+        participants = db.execute(
+            "SELECT * FROM participants WHERE race_id = ? "
+            "ORDER BY CAST(bib AS INTEGER), bib",
+            (race_id,),
+        ).fetchall()
+        elapsed = race_elapsed(race)
+        recorded_at = now_iso()
+        added = []
+        for participant in participants:
+            previous = db.execute(
+                "SELECT * FROM passages WHERE participant_id = ? AND cancelled = 0 "
+                "ORDER BY lap_number DESC LIMIT 1",
+                (participant["id"],),
+            ).fetchone()
+            if (
+                previous
+                and previous["lap_number"] >= race["laps"]
+                and not (race["target_seconds"] and race["laps"] == 1)
+            ):
+                continue
+            lap_number = (previous["lap_number"] if previous else 0) + 1
+            lap_seconds = elapsed - (previous["elapsed_seconds"] if previous else 0)
+            cursor = db.execute(
+                "INSERT INTO passages("
+                "race_id, participant_id, recorded_at, elapsed_seconds, lap_number, lap_seconds"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    race_id,
+                    participant["id"],
+                    recorded_at,
+                    elapsed,
+                    lap_number,
+                    max(0, lap_seconds),
+                ),
+            )
+            added.append({"id": cursor.lastrowid, "bib": participant["bib"]})
+        recalculate_target_laps(db, race_id)
+        db.commit()
+        return {"race_id": race_id, "added": len(added), "passages": added}
+
+
 @app.post("/api/passages/{passage_id}/cancel")
 def cancel_passage(passage_id: int) -> dict[str, bool]:
     with closing(connect()) as db:
@@ -777,13 +829,14 @@ async function record(){const input=$('bib');if(!input.value.trim())return;try{c
 async function createRace(e){e.preventDefault();try{const target=document.querySelector('input[name="raceMode"]:checked').value==='target';const name=$('raceName').value.trim();const laps=$('raceLaps').value.trim();const targetMinutes=$('raceTarget').value.trim();if(!name){flash('Renseignez le nom de la course');return}if(target&&!targetMinutes){flash('Renseignez le temps visé');return}if(!target&&!laps){flash('Renseignez le nombre de tours');return}const race=await api('/api/races',{method:'POST',body:JSON.stringify({name,laps:target?null:Number(laps),target_minutes:target?Number(targetMinutes):null,lap_distance_km:$('raceDistance').value?Number($('raceDistance').value):null})});e.target.reset();toggleRaceMode();await refresh();document.querySelector(`[data-race-id="${race.id}"]`)?.scrollIntoView({behavior:'smooth'})}catch(e){flash(e.message)}}
 async function timer(id,action){try{await api(`/api/races/${id}/timer/${action}`,{method:'POST'});refresh()}catch(e){flash(e.message)}}
 async function startSelected(){const ids=[...document.querySelectorAll('.race-select:checked')].map(input=>Number(input.value));if(!ids.length){flash('Sélectionnez au moins une course');return}try{await api('/api/races/timer/start-selected',{method:'POST',body:JSON.stringify({race_ids:ids})});flash('Chronomètres démarrés ensemble',true);await refresh()}catch(e){flash(e.message)}}
+async function bulkPassage(id){if(!confirm('Enregistrer un passage pour tous les coureurs actifs de cette course ?'))return;try{const result=await api(`/api/races/${id}/passages/bulk`,{method:'POST'});flash(`${result.added} passage(s) du peloton enregistré(s)`,true);await refresh()}catch(e){flash(e.message)}}
 async function editRace(id,button){const card=button.closest('[data-race-id]');const name=prompt('Nom de la course :',card.querySelector('h2').textContent);if(name===null||!name.trim())return;const laps=prompt('Nombre de tours :',card.dataset.laps);if(laps===null||!laps.trim()||Number(laps)<=0){flash('Renseignez un nombre de tours valide');return}const distance=prompt('Km par tour (laisser vide pour ne pas afficher la vitesse moyenne) :',card.dataset.distance||'');if(distance===null)return;const target=card.dataset.target?Number(card.dataset.target):null;const targetValue=target===null?null:prompt('Temps visé en minutes :',target);if(target!==null&&(targetValue===null||!targetValue.trim()||Number(targetValue)<=0)){flash('Renseignez un temps visé valide');return}try{await api(`/api/races/${id}/details`,{method:'PATCH',body:JSON.stringify({name:name.trim(),laps:Number(laps),target_minutes:targetValue===null?null:Number(targetValue),lap_distance_km:distance.trim()?Number(distance):null})});flash('Caractéristiques modifiées',true);await refresh()}catch(e){flash(e.message)}}
 async function removeRace(id,button){const name=button.closest('[data-race-id]').querySelector('h2').textContent;if(!confirm(`Supprimer la course « ${name} » et tout son historique ?`))return;try{await api(`/api/races/${id}`,{method:'DELETE'});flash('Course supprimée',true);await refresh()}catch(e){flash(e.message)}}
 async function updatePassage(id,button){const current=button.parentElement.querySelector('b').textContent;const bib=prompt('Nouveau dossard pour ce passage :',current);if(bib===null||!bib.trim()||bib.trim()===current)return;try{await api(`/api/passages/${id}`,{method:'PATCH',body:JSON.stringify({bib:bib.trim()})});flash('Dossard du passage modifié',true);await refresh()}catch(e){flash(e.message)}}
 async function setupParticipants(id,form){const fd=new FormData(form);try{await api(`/api/races/${id}/participants/setup`,{method:'POST',body:JSON.stringify({bibs:fd.get('bibs'),exclusions:fd.get('exclusions')})});form.reset();flash('Dossards et exclusions enregistrés',true);await refresh()}catch(e){flash(e.message)}}
 async function cancelPassage(id){try{await api(`/api/passages/${id}/cancel`,{method:'POST'});flash('Dernier passage annulé',true);refresh()}catch(e){flash(e.message)}}
-function row(x,showSpeed){return `<tr><td>${x.position}</td><td><b>${escapeHtml(x.bib)}</b></td><td>${x.laps_done}/${x.laps_done+x.laps_remaining}</td><td>${x.laps_remaining}</td><td>${x.laps_behind?'−'+x.laps_behind+' tour':'—'}</td><td>${fmt(x.last_lap_seconds)}</td>${showSpeed?`<td>${num(x.average_speed_kmh)} km/h</td>`:''}</tr>`}
-function raceCard(r,showSelection){let buttons=r.status==='ready'?`<button class="primary" onclick="timer(${r.id},'start')">Démarrer</button>`:r.status==='running'?`<button onclick="timer(${r.id},'pause')">Pause</button>`:r.status==='paused'?`<button class="primary" onclick="timer(${r.id},'resume')">Reprendre</button><button onclick="timer(${r.id},'stop')">Arrêter</button>`:'';let selection=showSelection&&r.status==='ready'?`<label class="select-race"><input class="race-select" type="checkbox" value="${r.id}"> Lancer avec la sélection</label>`:'';let laps=r.target_seconds?(r.laps>1?`${r.laps} tours`:`tours calculés après 2 tours · objectif ${Math.round(r.target_seconds/60)} min`):`${r.laps} tours`;let distance=r.lap_distance_km==null?'distance non définie':`${r.lap_distance_km} km/tour`;let standingsClass=r.standings.length>10?'standings-scroll':'';let showSpeed=r.lap_distance_km!=null;let speedHeader=showSpeed?'<th>Vitesse moy.</th>':'';let emptyColumns=showSpeed?7:6;return `<article class="card" data-race-id="${r.id}" data-laps="${r.laps}" data-target="${r.target_seconds?Math.round(r.target_seconds/60):''}" data-distance="${r.lap_distance_km??''}"><div class="card-head"><div><h2>${escapeHtml(r.name)}</h2><div class="muted">${laps} · ${escapeHtml(distance)} · ${r.participant_count} participants · ${r.finished_count} terminé(s)</div></div><div><div class="timer" data-elapsed="${r.elapsed_seconds}" data-status="${r.status}">${fmt(r.elapsed_seconds)}</div><span class="status">${r.status}</span></div></div><div class="controls">${buttons}${selection}<button onclick="editRace(${r.id},this)">Modifier</button><button onclick="removeRace(${r.id},this)">Supprimer</button></div><form class="form" onsubmit="setupParticipants(${r.id},this);return false"><input name="bibs" placeholder="Dossards : 1 2 3 ou 4-65"><input name="exclusions" placeholder="Exclus : 7 12 ou 40-45"><button class="button">Enregistrer les dossards</button></form><div class="${standingsClass}"><table><thead><tr><th>#</th><th>Dossard</th><th>Tours</th><th>Tours restants</th><th>Retard</th><th>Dernier tour</th>${speedHeader}</tr></thead><tbody>${r.standings.map(item=>row(item,showSpeed)).join('')||`<tr><td colspan="${emptyColumns}" class="muted">Configurez les dossards de cette course.</td></tr>`}</tbody></table></div></article>`}
+function row(x,showSpeed){return `<tr><td>${x.position}</td><td><b>${escapeHtml(x.bib)}</b></td><td>${x.laps_done}/${x.laps_done+x.laps_remaining}</td><td>${x.laps_remaining}</td><td>${x.laps_behind?'−'+x.laps_behind+' tour':'—'}</td><td>${fmt(x.last_lap_seconds)}</td><td>${x.finished?fmt(x.total_seconds):'—'}</td>${showSpeed?`<td>${num(x.average_speed_kmh)} km/h</td>`:''}</tr>`}
+function raceCard(r,showSelection){let buttons=r.status==='ready'?`<button class="primary" onclick="timer(${r.id},'start')">Démarrer</button>`:r.status==='running'?`<button onclick="timer(${r.id},'pause')">Pause</button><button onclick="bulkPassage(${r.id})">Passage du peloton</button>`:r.status==='paused'?`<button class="primary" onclick="timer(${r.id},'resume')">Reprendre</button><button onclick="timer(${r.id},'stop')">Arrêter</button>`:'';let selection=showSelection&&r.status==='ready'?`<label class="select-race"><input class="race-select" type="checkbox" value="${r.id}"> Lancer avec la sélection</label>`:'';let laps=r.target_seconds?(r.laps>1?`${r.laps} tours`:`tours calculés après 2 tours · objectif ${Math.round(r.target_seconds/60)} min`):`${r.laps} tours`;let distance=r.lap_distance_km==null?'distance non définie':`${r.lap_distance_km} km/tour`;let standingsClass=r.standings.length>10?'standings-scroll':'';let showSpeed=r.lap_distance_km!=null;let speedHeader=showSpeed?'<th>Vitesse moy.</th>':'';let emptyColumns=showSpeed?8:7;return `<article class="card" data-race-id="${r.id}" data-laps="${r.laps}" data-target="${r.target_seconds?Math.round(r.target_seconds/60):''}" data-distance="${r.lap_distance_km??''}"><div class="card-head"><div><h2>${escapeHtml(r.name)}</h2><div class="muted">${laps} · ${escapeHtml(distance)} · ${r.participant_count} participants · ${r.finished_count} terminé(s)</div></div><div><div class="timer" data-elapsed="${r.elapsed_seconds}" data-status="${r.status}">${fmt(r.elapsed_seconds)}</div><span class="status">${r.status}</span></div></div><div class="controls">${buttons}${selection}<button onclick="editRace(${r.id},this)">Modifier</button><button onclick="removeRace(${r.id},this)">Supprimer</button></div><form class="form" onsubmit="setupParticipants(${r.id},this);return false"><input name="bibs" placeholder="Dossards : 1 2 3 ou 4-65"><input name="exclusions" placeholder="Exclus : 7 12 ou 40-45"><button class="button">Enregistrer les dossards</button></form><div class="${standingsClass}"><table><thead><tr><th>#</th><th>Dossard</th><th>Tours</th><th>Tours restants</th><th>Retard</th><th>Dernier tour</th><th>Temps total</th>${speedHeader}</tr></thead><tbody>${r.standings.map(item=>row(item,showSpeed)).join('')||`<tr><td colspan="${emptyColumns}" class="muted">Configurez les dossards de cette course.</td></tr>`}</tbody></table></div></article>`}
 let timerSyncAt=performance.now();
 function updateTimers(){const elapsed=performance.now()-timerSyncAt;document.querySelectorAll('.timer[data-elapsed]').forEach(timer=>{const base=Number(timer.dataset.elapsed);const value=timer.dataset.status==='running'?base+elapsed/1000:base;timer.textContent=fmt(value)})}
 async function refresh(){if(document.activeElement&&document.activeElement.matches('input,textarea'))return;const scrollPositions={};document.querySelectorAll('[data-race-id] .standings-scroll').forEach(element=>{scrollPositions[element.closest('[data-race-id]').dataset.raceId]=element.scrollTop});const [races,recent]=await Promise.all([api('/api/races'),api('/api/passages/recent')]);const showSelection=races.filter(r=>r.status==='ready').length>=2;$('sync-controls').style.display=showSelection?'block':'none';$('races').innerHTML=races.map(r=>raceCard(r,showSelection)).join('');Object.entries(scrollPositions).forEach(([raceId,scrollTop])=>{const element=document.querySelector(`[data-race-id="${raceId}"] .standings-scroll`);if(element)element.scrollTop=scrollTop});timerSyncAt=performance.now();updateTimers();$('recent').innerHTML=recent.map(x=>`<div><b>${escapeHtml(x.bib)}</b> · ${escapeHtml(x.race_name)} · tour ${x.lap_number} · ${fmt(x.lap_seconds)} <button onclick="updatePassage(${x.id},this)">Modifier</button> <button onclick="cancelPassage(${x.id})">Annuler</button></div>`).join('')||'<span class="muted">Aucun passage.</span>'}

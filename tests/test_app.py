@@ -189,6 +189,47 @@ def test_passages_increment_laps_and_are_cancelled(
     assert main.recent_passages() == []
 
 
+def test_bulk_passage_records_active_participants_at_same_time(
+    isolated_database: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    race_id = create_race("Peloton race", laps=3)
+    main.setup_participants(race_id, main.ParticipantSetupInput(bibs="1 2 3"))
+    set_race_running(race_id)
+    monkeypatch.setattr(main, "race_elapsed", lambda row: 42.0)
+
+    result = main.record_bulk_passages(race_id)
+
+    assert result["added"] == 3
+    with main.connect() as db:
+        rows = db.execute(
+            "SELECT elapsed_seconds, lap_number FROM passages "
+            "WHERE race_id = ? ORDER BY participant_id",
+            (race_id,),
+        ).fetchall()
+    assert [(row["elapsed_seconds"], row["lap_number"]) for row in rows] == [
+        (42.0, 1),
+        (42.0, 1),
+        (42.0, 1),
+    ]
+
+
+def test_bulk_passage_skips_finished_participants(
+    isolated_database: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    race_id = create_race("Peloton finish", laps=1)
+    main.setup_participants(race_id, main.ParticipantSetupInput(bibs="1 2"))
+    set_race_running(race_id)
+    monkeypatch.setattr(main, "race_elapsed", lambda row: 42.0)
+    main.record_passage(main.PassageInput(bib="1"))
+
+    result = main.record_bulk_passages(race_id)
+
+    assert result["added"] == 1
+    assert result["passages"][0]["bib"] == "2"
+
+
 def test_passage_bib_can_be_corrected_within_the_same_race(
     isolated_database: None,
 ) -> None:
@@ -366,12 +407,16 @@ def test_frontend_escapes_user_controlled_values(isolated_database: None) -> Non
     assert "tours calculés après 2 tours" in html
     assert "r.laps>1?`${r.laps} tours`" in html
     assert "<th>Tours restants</th>" in html
+    assert "<th>Temps total</th>" in html
+    assert "x.finished?fmt(x.total_seconds):'—'" in html
     assert 'id="sync-controls"' in html
     assert "races.filter(r=>r.status==='ready').length>=2" in html
     assert "function raceCard(r,showSelection)" in html
     assert "showSelection&&r.status==='ready'" in html
     assert "races.map(r=>raceCard(r,showSelection))" in html
-    assert "r.status==='running'?`<button onclick=\"timer(${r.id},'pause')\">Pause</button>`" in html
+    assert "async function bulkPassage(id)" in html
+    assert "onclick=\"bulkPassage(${r.id})\"" in html
+    assert "r.status==='running'?`<button onclick=\"timer(${r.id},'pause')\">Pause</button><button onclick=\"bulkPassage(${r.id})\">Passage du peloton</button>`" in html
     assert "escapeHtml(r.name)" in html
     assert "escapeHtml(x.race_name)" in html
     assert "escapeHtml(x.bib)" in html
