@@ -20,8 +20,6 @@ with FastAPI and SQLite, with no remote server or cloud service required.
 - Edit race names and bib assignments.
 - Edit race characteristics, including lap count, target duration, and lap
   distance.
-- Scroll rankings containing more than ten riders.
-- Import participants from UTF-8 CSV or XLSX files.
 - Persist data in a local SQLite database.
 
 ## Requirements
@@ -68,8 +66,6 @@ python run.py
 ```
 
 Open <http://127.0.0.1:8000> in a browser.
-
-Press `Ctrl+C` in the terminal to stop the server.
 
 ## Race setup
 

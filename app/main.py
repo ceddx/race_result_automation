@@ -227,7 +227,30 @@ def participant_stats(db: sqlite3.Connection, participant: sqlite3.Row, race: sq
     }
 
 
+def normalize_passages(db: sqlite3.Connection, race_id: int) -> None:
+    passages = db.execute(
+        "SELECT id, participant_id, elapsed_seconds FROM passages "
+        "WHERE race_id = ? AND cancelled = 0 "
+        "ORDER BY participant_id, recorded_at, id",
+        (race_id,),
+    ).fetchall()
+    previous_elapsed: dict[int, float] = {}
+    lap_numbers: dict[int, int] = {}
+    for passage in passages:
+        participant_id = passage["participant_id"]
+        lap_number = lap_numbers.get(participant_id, 0) + 1
+        elapsed = float(passage["elapsed_seconds"])
+        lap_seconds = max(0.0, elapsed - previous_elapsed.get(participant_id, 0.0))
+        db.execute(
+            "UPDATE passages SET lap_number = ?, lap_seconds = ? WHERE id = ?",
+            (lap_number, lap_seconds, passage["id"]),
+        )
+        lap_numbers[participant_id] = lap_number
+        previous_elapsed[participant_id] = elapsed
+
+
 def recalculate_target_laps(db: sqlite3.Connection, race_id: int) -> None:
+    normalize_passages(db, race_id)
     race = db.execute(
         "SELECT target_seconds FROM races WHERE id = ?",
         (race_id,),
@@ -713,7 +736,7 @@ HTML = r"""<!doctype html>
 <title>Chronométrage cycliste</title>
 <style>
 :root{font-family:Inter,Segoe UI,sans-serif;color:#172033;background:#f2f5f8}*{box-sizing:border-box}
-body{margin:0}.top{background:#10233f;color:white;padding:18px 24px;display:flex;justify-content:space-between;align-items:center}
+body{margin:0;min-height:100vh;display:flex;flex-direction:column}.top{background:#10233f;color:white;padding:18px 24px;display:flex;justify-content:space-between;align-items:center}
 h1,h2,h3{margin:0 0 12px}.top h1{font-size:22px}.layout{max-width:1500px;margin:auto;padding:20px}
 .inputbar{position:sticky;top:0;z-index:2;background:white;padding:16px;border-radius:12px;box-shadow:0 2px 12px #13233d22;margin-bottom:20px}
 .inputbar input{font-size:28px;width:180px;padding:8px 12px;border:2px solid #aeb9c8;border-radius:8px}.inputbar button,.button{border:0;border-radius:8px;padding:11px 16px;font-weight:700;cursor:pointer;background:#1769aa;color:#fff}
@@ -722,7 +745,7 @@ h1,h2,h3{margin:0 0 12px}.top h1{font-size:22px}.layout{max-width:1500px;margin:
 .card-head{display:flex;justify-content:space-between;gap:12px}.timer{font:700 28px ui-monospace,monospace;color:#1769aa}.status{font-size:12px;text-transform:uppercase;font-weight:700;padding:5px 8px;border-radius:20px;background:#e8edf3}
 .controls{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}.controls button{padding:8px 12px;border:1px solid #c8d1dc;background:#fff;border-radius:7px;cursor:pointer}.controls button.primary{background:#1769aa;color:#fff}.select-race{display:flex;align-items:center;gap:5px;padding:8px 4px;font-size:13px}
 table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:8px 5px;border-bottom:1px solid #e8edf3}th{color:#59697e}.standings-scroll{max-height:360px;overflow-y:auto}.muted{color:#68778a;font-size:13px}.form{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}.form input{padding:8px;border:1px solid #bcc8d5;border-radius:6px;min-width:100px}.section{margin-top:20px}.recent{max-height:250px;overflow:auto}
-.footer{margin-top:30px;padding:22px 24px;background:white;display:flex;justify-content:space-between;align-items:center;gap:20px;color:#59697e}.footer-logo{width:130px;height:70px;object-fit:contain}
+.layout{flex:1;width:100%}.footer{margin-top:30px;padding:22px 24px;background:white;display:flex;justify-content:space-between;align-items:center;gap:20px;color:#59697e}.footer-logo{width:130px;height:70px;object-fit:contain}
 @media(max-width:650px){.layout{padding:10px}.grid{grid-template-columns:1fr}.top{padding:14px}.inputbar input{width:130px}.message{display:block;margin:10px 0 0}}
 </style></head>
 <body><header class="top"><h1>Chronométrage cycliste</h1><span>Classement provisoire</span></header>
@@ -760,10 +783,10 @@ async function updatePassage(id,button){const current=button.parentElement.query
 async function setupParticipants(id,form){const fd=new FormData(form);try{await api(`/api/races/${id}/participants/setup`,{method:'POST',body:JSON.stringify({bibs:fd.get('bibs'),exclusions:fd.get('exclusions')})});form.reset();flash('Dossards et exclusions enregistrés',true);await refresh()}catch(e){flash(e.message)}}
 async function cancelPassage(id){try{await api(`/api/passages/${id}/cancel`,{method:'POST'});flash('Dernier passage annulé',true);refresh()}catch(e){flash(e.message)}}
 function row(x,showSpeed){return `<tr><td>${x.position}</td><td><b>${escapeHtml(x.bib)}</b></td><td>${x.laps_done}/${x.laps_done+x.laps_remaining}</td><td>${x.laps_remaining}</td><td>${x.laps_behind?'−'+x.laps_behind+' tour':'—'}</td><td>${fmt(x.last_lap_seconds)}</td>${showSpeed?`<td>${num(x.average_speed_kmh)} km/h</td>`:''}</tr>`}
-function raceCard(r){let buttons=r.status==='ready'?`<button class="primary" onclick="timer(${r.id},'start')">Démarrer</button>`:r.status==='running'?`<button onclick="timer(${r.id},'pause')">Pause</button>`:r.status==='paused'?`<button class="primary" onclick="timer(${r.id},'resume')">Reprendre</button><button onclick="timer(${r.id},'stop')">Arrêter</button>`:'';let selection=r.status==='ready'?`<label class="select-race"><input class="race-select" type="checkbox" value="${r.id}"> Lancer avec la sélection</label>`:'';let laps=r.target_seconds?(r.laps>1?`${r.laps} tours`:`tours calculés après 2 tours · objectif ${Math.round(r.target_seconds/60)} min`):`${r.laps} tours`;let distance=r.lap_distance_km==null?'distance non définie':`${r.lap_distance_km} km/tour`;let standingsClass=r.standings.length>10?'standings-scroll':'';let showSpeed=r.lap_distance_km!=null;let speedHeader=showSpeed?'<th>Vitesse moy.</th>':'';let emptyColumns=showSpeed?7:6;return `<article class="card" data-race-id="${r.id}" data-laps="${r.laps}" data-target="${r.target_seconds?Math.round(r.target_seconds/60):''}" data-distance="${r.lap_distance_km??''}"><div class="card-head"><div><h2>${escapeHtml(r.name)}</h2><div class="muted">${laps} · ${escapeHtml(distance)} · ${r.participant_count} participants · ${r.finished_count} terminé(s)</div></div><div><div class="timer" data-elapsed="${r.elapsed_seconds}" data-status="${r.status}">${fmt(r.elapsed_seconds)}</div><span class="status">${r.status}</span></div></div><div class="controls">${buttons}${selection}<button onclick="editRace(${r.id},this)">Modifier</button><button onclick="removeRace(${r.id},this)">Supprimer</button></div><form class="form" onsubmit="setupParticipants(${r.id},this);return false"><input name="bibs" placeholder="Dossards : 1 2 3 ou 4-65"><input name="exclusions" placeholder="Exclus : 7 12 ou 40-45"><button class="button">Enregistrer les dossards</button></form><div class="${standingsClass}"><table><thead><tr><th>#</th><th>Dossard</th><th>Tours</th><th>Tours restants</th><th>Retard</th><th>Dernier tour</th>${speedHeader}</tr></thead><tbody>${r.standings.map(item=>row(item,showSpeed)).join('')||`<tr><td colspan="${emptyColumns}" class="muted">Configurez les dossards de cette course.</td></tr>`}</tbody></table></div></article>`}
+function raceCard(r,showSelection){let buttons=r.status==='ready'?`<button class="primary" onclick="timer(${r.id},'start')">Démarrer</button>`:r.status==='running'?`<button onclick="timer(${r.id},'pause')">Pause</button>`:r.status==='paused'?`<button class="primary" onclick="timer(${r.id},'resume')">Reprendre</button><button onclick="timer(${r.id},'stop')">Arrêter</button>`:'';let selection=showSelection&&r.status==='ready'?`<label class="select-race"><input class="race-select" type="checkbox" value="${r.id}"> Lancer avec la sélection</label>`:'';let laps=r.target_seconds?(r.laps>1?`${r.laps} tours`:`tours calculés après 2 tours · objectif ${Math.round(r.target_seconds/60)} min`):`${r.laps} tours`;let distance=r.lap_distance_km==null?'distance non définie':`${r.lap_distance_km} km/tour`;let standingsClass=r.standings.length>10?'standings-scroll':'';let showSpeed=r.lap_distance_km!=null;let speedHeader=showSpeed?'<th>Vitesse moy.</th>':'';let emptyColumns=showSpeed?7:6;return `<article class="card" data-race-id="${r.id}" data-laps="${r.laps}" data-target="${r.target_seconds?Math.round(r.target_seconds/60):''}" data-distance="${r.lap_distance_km??''}"><div class="card-head"><div><h2>${escapeHtml(r.name)}</h2><div class="muted">${laps} · ${escapeHtml(distance)} · ${r.participant_count} participants · ${r.finished_count} terminé(s)</div></div><div><div class="timer" data-elapsed="${r.elapsed_seconds}" data-status="${r.status}">${fmt(r.elapsed_seconds)}</div><span class="status">${r.status}</span></div></div><div class="controls">${buttons}${selection}<button onclick="editRace(${r.id},this)">Modifier</button><button onclick="removeRace(${r.id},this)">Supprimer</button></div><form class="form" onsubmit="setupParticipants(${r.id},this);return false"><input name="bibs" placeholder="Dossards : 1 2 3 ou 4-65"><input name="exclusions" placeholder="Exclus : 7 12 ou 40-45"><button class="button">Enregistrer les dossards</button></form><div class="${standingsClass}"><table><thead><tr><th>#</th><th>Dossard</th><th>Tours</th><th>Tours restants</th><th>Retard</th><th>Dernier tour</th>${speedHeader}</tr></thead><tbody>${r.standings.map(item=>row(item,showSpeed)).join('')||`<tr><td colspan="${emptyColumns}" class="muted">Configurez les dossards de cette course.</td></tr>`}</tbody></table></div></article>`}
 let timerSyncAt=performance.now();
 function updateTimers(){const elapsed=performance.now()-timerSyncAt;document.querySelectorAll('.timer[data-elapsed]').forEach(timer=>{const base=Number(timer.dataset.elapsed);const value=timer.dataset.status==='running'?base+elapsed/1000:base;timer.textContent=fmt(value)})}
-async function refresh(){if(document.activeElement&&document.activeElement.matches('input,textarea'))return;const scrollPositions={};document.querySelectorAll('[data-race-id] .standings-scroll').forEach(element=>{scrollPositions[element.closest('[data-race-id]').dataset.raceId]=element.scrollTop});const [races,recent]=await Promise.all([api('/api/races'),api('/api/passages/recent')]);$('sync-controls').style.display=races.filter(r=>r.status==='ready').length>=2?'block':'none';$('races').innerHTML=races.map(raceCard).join('');Object.entries(scrollPositions).forEach(([raceId,scrollTop])=>{const element=document.querySelector(`[data-race-id="${raceId}"] .standings-scroll`);if(element)element.scrollTop=scrollTop});timerSyncAt=performance.now();updateTimers();$('recent').innerHTML=recent.map(x=>`<div><b>${escapeHtml(x.bib)}</b> · ${escapeHtml(x.race_name)} · tour ${x.lap_number} · ${fmt(x.lap_seconds)} <button onclick="updatePassage(${x.id},this)">Modifier</button> <button onclick="cancelPassage(${x.id})">Annuler</button></div>`).join('')||'<span class="muted">Aucun passage.</span>'}
+async function refresh(){if(document.activeElement&&document.activeElement.matches('input,textarea'))return;const scrollPositions={};document.querySelectorAll('[data-race-id] .standings-scroll').forEach(element=>{scrollPositions[element.closest('[data-race-id]').dataset.raceId]=element.scrollTop});const [races,recent]=await Promise.all([api('/api/races'),api('/api/passages/recent')]);const showSelection=races.filter(r=>r.status==='ready').length>=2;$('sync-controls').style.display=showSelection?'block':'none';$('races').innerHTML=races.map(r=>raceCard(r,showSelection)).join('');Object.entries(scrollPositions).forEach(([raceId,scrollTop])=>{const element=document.querySelector(`[data-race-id="${raceId}"] .standings-scroll`);if(element)element.scrollTop=scrollTop});timerSyncAt=performance.now();updateTimers();$('recent').innerHTML=recent.map(x=>`<div><b>${escapeHtml(x.bib)}</b> · ${escapeHtml(x.race_name)} · tour ${x.lap_number} · ${fmt(x.lap_seconds)} <button onclick="updatePassage(${x.id},this)">Modifier</button> <button onclick="cancelPassage(${x.id})">Annuler</button></div>`).join('')||'<span class="muted">Aucun passage.</span>'}
 $('bib').addEventListener('keydown',e=>{if(e.key==='Enter')record()});refresh();setInterval(refresh,1000);setInterval(updateTimers,10);
 </script></body></html>"""
 

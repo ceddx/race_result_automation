@@ -206,6 +206,40 @@ def test_passage_bib_can_be_corrected_within_the_same_race(
     assert main.recent_passages()[0]["bib"] == "13"
 
 
+def test_passage_correction_renumbers_remaining_passages(
+    isolated_database: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    race_id = create_race(laps=7)
+    main.setup_participants(race_id, main.ParticipantSetupInput(bibs="1 2"))
+    set_race_running(race_id)
+
+    def elapsed(row: object) -> float:
+        with main.connect() as db:
+            count = db.execute(
+                "SELECT COUNT(*) FROM passages WHERE race_id = ? AND cancelled = 0",
+                (race_id,),
+            ).fetchone()[0]
+        return (count + 1) * 10.0
+
+    monkeypatch.setattr(main, "race_elapsed", elapsed)
+    passages = [
+        main.record_passage(main.PassageInput(bib="1"))
+        for _ in range(6)
+    ]
+
+    main.update_passage_bib(
+        passages[2]["id"],
+        main.PassageBibUpdateInput(bib="2"),
+    )
+    next_passage = main.record_passage(main.PassageInput(bib="1"))
+
+    assert next_passage["lap_number"] == 6
+    standings = {item["bib"]: item for item in main.list_races()[0]["standings"]}
+    assert standings["1"]["laps_done"] == 6
+    assert standings["1"]["laps_remaining"] == 1
+
+
 def test_unknown_or_finished_bibs_are_rejected(isolated_database: None) -> None:
     race_id = create_race(laps=1)
     main.setup_participants(race_id, main.ParticipantSetupInput(bibs="7"))
@@ -324,6 +358,8 @@ def test_frontend_escapes_user_controlled_values(isolated_database: None) -> Non
     html = main.index()
 
     assert "const escapeHtml=" in html
+    assert "body{margin:0;min-height:100vh;display:flex;flex-direction:column}" in html
+    assert ".layout{flex:1;width:100%}" in html
     assert "Créé par Cedric Grandvaux" in html
     assert "cedric.grandvaux@gmail.com" in html
     assert 'src="/logo-ffc.png"' in html
@@ -332,6 +368,9 @@ def test_frontend_escapes_user_controlled_values(isolated_database: None) -> Non
     assert "<th>Tours restants</th>" in html
     assert 'id="sync-controls"' in html
     assert "races.filter(r=>r.status==='ready').length>=2" in html
+    assert "function raceCard(r,showSelection)" in html
+    assert "showSelection&&r.status==='ready'" in html
+    assert "races.map(r=>raceCard(r,showSelection))" in html
     assert "r.status==='running'?`<button onclick=\"timer(${r.id},'pause')\">Pause</button>`" in html
     assert "escapeHtml(r.name)" in html
     assert "escapeHtml(x.race_name)" in html
